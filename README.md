@@ -51,6 +51,15 @@ cargo build --release
 
 The binary is at `target/release/escpresso`.
 
+### macOS application and DMG
+
+In this fork, run `bash scripts/package-macos.sh` on macOS to build an Apple
+Silicon app and DMG. See [macOS packaging](docs/MACOS.md) for requirements,
+Intel builds, and signing details.
+
+See [raster rendering](docs/RASTER_RENDERING.md) for image sizing, paper feed
+behavior, and regression tests for receipt slices.
+
 ## Usage
 
 ### Start the emulator

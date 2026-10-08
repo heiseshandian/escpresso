@@ -1,4 +1,6 @@
 /target
+/.build-tools/
+/dist/
 .claude/
 CLAUDE.md
 /references/
