@@ -7,6 +7,9 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+#[cfg(test)]
+mod raster_tests;
+
 const ESC: u8 = 0x1B;
 const GS: u8 = 0x1D;
 const FS: u8 = 0x1C;
@@ -63,7 +66,7 @@ impl PaperSize {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 enum ReceiptElement {
     Text {
         content: String,
@@ -80,6 +83,7 @@ enum ReceiptElement {
         double_strike: bool,
         font: u8,
         print_area_width: u16,
+        line_spacing: usize,
     },
     RasterImage {
         width: usize, // Width in pixels (for display)
@@ -90,6 +94,7 @@ enum ReceiptElement {
         alignment: Alignment,
         bytes_per_line: usize, // Actual bytes per line from command (for data reading)
         print_area_width: u16,
+        scale: [usize; 2], // Dot-density or raster mode scaling, never inferred from image size
     },
     QrCode {
         data: String,
@@ -106,11 +111,13 @@ enum ReceiptElement {
         on_time: u8,
         off_time: u8,
     },
-    Separator,
+    PaperFeed {
+        dots: usize,
+    },
     FormFeed,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 enum Alignment {
     Left,
     Center,
@@ -174,6 +181,7 @@ struct EscPosRenderer {
     qr_error_correction: u8,
     response_queue: Vec<u8>,
     last_was_binary: bool, // Track if last command was binary (raster, etc.)
+    bit_image_line_height: usize, // ESC * has been drawn but still awaits a print/feed command
 }
 
 impl EscPosRenderer {
@@ -190,6 +198,7 @@ impl EscPosRenderer {
             qr_error_correction: 0,
             response_queue: Vec::new(),
             last_was_binary: false,
+            bit_image_line_height: 0,
         }
     }
 
@@ -457,15 +466,7 @@ impl EscPosRenderer {
                 LF => {
                     // LF: Print and line feed - flush current line and advance
                     self.in_command_sequence = false; // Exit command sequence, allow text again
-                    self.last_was_binary = false; // LF marks start of text content
-                    if !self.current_line.is_empty() {
-                        self.flush_line();
-                        self.current_line.clear();
-                    } else if !self.elements.is_empty() {
-                        // Only add separator for blank lines if we've already printed something
-                        // This avoids extra spacing after init commands like ESC @
-                        self.elements.push(ReceiptElement::Separator);
-                    }
+                    self.print_and_feed(self.state.line_spacing as usize);
                     i += 1;
                 }
                 CR => {
@@ -527,7 +528,30 @@ impl EscPosRenderer {
         Ok(())
     }
 
+    fn print_and_feed(&mut self, dots: usize) {
+        // ESC * occupies the current line; GS v 0 already advances by its image height.
+        // Keep this state outside `elements`, which is drained after each TCP read.
+        let remaining_feed = dots.saturating_sub(self.bit_image_line_height);
+        if self.current_line.is_empty() {
+            if remaining_feed > 0 {
+                self.elements.push(ReceiptElement::PaperFeed {
+                    dots: remaining_feed,
+                });
+            }
+        } else {
+            self.flush_line_with_spacing(remaining_feed);
+            self.current_line.clear();
+        }
+        self.bit_image_line_height = 0;
+        self.last_was_binary = false;
+        self.state.horizontal_offset = 0;
+    }
+
     fn flush_line(&mut self) {
+        self.flush_line_with_spacing(0);
+    }
+
+    fn flush_line_with_spacing(&mut self, line_spacing: usize) {
         if self.current_line.is_empty() {
             return;
         }
@@ -580,6 +604,7 @@ impl EscPosRenderer {
             double_strike: self.state.double_strike,
             font: self.state.font,
             print_area_width: self.state.print_area_width,
+            line_spacing,
         });
 
         // Reset horizontal offset after use (ESC $ is one-time positioning)
@@ -588,9 +613,20 @@ impl EscPosRenderer {
 
     fn handle_esc_command(&mut self, data: &[u8], mut i: usize) -> Result<usize> {
         let cmd = data[i];
+        // Do not apply positioning or feed commands until their parameters arrive.
+        let parameters = match cmd {
+            b'3' | b'd' | b'J' | b'a' | b'!' | b'E' | b'-' => 1,
+            b'$' | b'\\' => 2,
+            _ => 0,
+        };
+        if i + 1 + parameters > data.len() {
+            return Ok(i - 1);
+        }
         match cmd {
             b'@' => {
                 self.state = PrinterState::default();
+                self.bit_image_line_height = 0;
+                self.last_was_binary = false;
                 i += 1;
             }
             b'E' => {
@@ -637,8 +673,11 @@ impl EscPosRenderer {
                 i += 1;
                 if i < data.len() {
                     let lines = data[i];
+                    if lines == 0 {
+                        self.print_and_feed(0);
+                    }
                     for _ in 0..lines {
-                        self.elements.push(ReceiptElement::Separator);
+                        self.print_and_feed(self.state.line_spacing as usize);
                     }
                     i += 1;
                 }
@@ -887,16 +926,12 @@ impl EscPosRenderer {
                 }
             }
             b'J' => {
-                // ESC J n - Print and feed n lines (used by zj-58 CUPS driver)
+                // ESC J n - Print and feed n vertical motion units (dots at 203 DPI)
                 i += 1;
                 if i < data.len() {
-                    let lines = data[i];
-                    self.log_debug(&format!("ESC J: feed {} lines", lines));
-                    // Add line feeds as specified (each line is ~1/6 inch or ~4.23mm)
-                    // Display exactly as ESC/POS specifies for accurate virtual printer behavior
-                    for _ in 0..lines {
-                        self.elements.push(ReceiptElement::Separator);
-                    }
+                    let dots = data[i] as usize;
+                    self.log_debug(&format!("ESC J: feed {} dots", dots));
+                    self.print_and_feed(dots);
                     i += 1;
                 }
             }
@@ -965,6 +1000,14 @@ impl EscPosRenderer {
 
     fn handle_gs_command(&mut self, data: &[u8], mut i: usize) -> Result<usize> {
         let cmd = data[i];
+        let parameters = match cmd {
+            b'L' | b'W' => 2,
+            b'V' | b'!' | b'8' => 1,
+            _ => 0,
+        };
+        if i + 1 + parameters > data.len() {
+            return Ok(i - 1);
+        }
         match cmd {
             b'8' => {
                 // GS 8 - Extended command (L = raster graphics)
@@ -1025,9 +1068,7 @@ impl EscPosRenderer {
             }
             b'v' => {
                 i += 1;
-                if i < data.len() {
-                    i = self.handle_raster_graphics_gs(data, i)?;
-                }
+                i = self.handle_raster_graphics_gs(data, i)?;
             }
             b'!' => {
                 // GS ! - Select character size (width and height multipliers)
@@ -1308,6 +1349,14 @@ impl EscPosRenderer {
         // Convert column-based data to row-based raster data for rendering
         let column_data = &data[pos..pos + total_bytes];
         let raster_data = self.column_to_raster(column_data, width, height);
+        // At the default 203 DPI, 8-dot modes use one third of the vertical
+        // density and single-density modes use half the horizontal density.
+        let scale = match m {
+            0 => [2, 3],
+            1 => [1, 3],
+            32 => [2, 1],
+            _ => [1, 1],
+        };
 
         self.elements.push(ReceiptElement::RasterImage {
             width,
@@ -1318,7 +1367,9 @@ impl EscPosRenderer {
             alignment: self.state.alignment.clone(),
             bytes_per_line: width.div_ceil(8), // Calculate from pixel width
             print_area_width: self.state.print_area_width,
+            scale,
         });
+        self.bit_image_line_height += height * scale[1];
 
         // Reset offset after rendering
         self.state.horizontal_offset = 0;
@@ -1392,7 +1443,7 @@ impl EscPosRenderer {
         // escRasterMode[] = "\x1dv0\0" sends: GS v '0' 0x00
         // Then mputnum(width) and mputnum(height) send little-endian 2-byte values
         let variant = data[i]; // '0' = 0x30
-        let _m = data[i + 1]; // 0x00 (mode)
+        let m = data[i + 1]; // 0x00 (mode)
         let xl = data[i + 2] as usize;
         let xh = data[i + 3] as usize;
         let yl = data[i + 4] as usize;
@@ -1409,7 +1460,7 @@ impl EscPosRenderer {
         ));
         self.log_debug(&format!(
             "GS v: variant=0x{:02X} m=0x{:02X}, xl=0x{:02X} xh=0x{:02X} yl=0x{:02X} yh=0x{:02X}",
-            variant, _m, xl, xh, yl, yh
+            variant, m, xl, xh, yl, yh
         ));
 
         let mut pos = i + 6;
@@ -1527,7 +1578,14 @@ impl EscPosRenderer {
             alignment: self.state.alignment.clone(),
             bytes_per_line: width_in_bytes, // Use actual bytes from command
             print_area_width: self.state.print_area_width,
+            scale: match m {
+                1 | 49 => [2, 1],
+                2 | 50 => [1, 2],
+                3 | 51 => [2, 2],
+                _ => [1, 1],
+            },
         });
+        self.bit_image_line_height = 0;
 
         // Reset offset after rendering
         self.state.horizontal_offset = 0;
@@ -1625,6 +1683,7 @@ impl EscPosRenderer {
                 alignment: self.state.alignment.clone(),
                 bytes_per_line: width.div_ceil(8), // Calculate from pixel width
                 print_area_width: self.state.print_area_width,
+                scale: [1, 1],
             });
 
             // Reset offset after rendering
@@ -1747,6 +1806,7 @@ impl EscPosRenderer {
         self.elements.push(ReceiptElement::PaperCut {
             cut_type: cut_type.to_string(),
         });
+        self.bit_image_line_height = 0;
 
         Ok(i)
     }
@@ -2143,6 +2203,7 @@ impl eframe::App for VirtualEscPosApp {
                                                 double_strike,
                                                 font,
                                                 print_area_width,
+                                                line_spacing,
                                             } => {
                                                 let mut job = egui::text::LayoutJob::default();
 
@@ -2235,7 +2296,8 @@ impl eframe::App for VirtualEscPosApp {
                                                 let galley = ui.fonts(|f| f.layout_job(job));
 
                                                 // Allocate full width for 80mm receipt paper
-                                                let line_height = galley.size().y;
+                                                let line_height =
+                                                    galley.size().y.max(*line_spacing as f32);
 
                                                 let (rect, _) = ui.allocate_exact_size(
                                                     egui::vec2(printer_width_px, line_height),
@@ -2296,6 +2358,7 @@ impl eframe::App for VirtualEscPosApp {
                                                 alignment,
                                                 bytes_per_line,
                                                 print_area_width,
+                                                scale,
                                             } => {
                                                 render_raster_image(
                                                     ui,
@@ -2308,6 +2371,7 @@ impl eframe::App for VirtualEscPosApp {
                                                     printer_width_px,
                                                     *bytes_per_line,
                                                     *print_area_width,
+                                                    *scale,
                                                 );
                                             }
                                             ReceiptElement::QrCode {
@@ -2353,8 +2417,8 @@ impl eframe::App for VirtualEscPosApp {
                                                 ));
                                                 ui.separator();
                                             }
-                                            ReceiptElement::Separator => {
-                                                ui.add_space(4.0);
+                                            ReceiptElement::PaperFeed { dots } => {
+                                                ui.add_space(*dots as f32);
                                             }
                                             ReceiptElement::FormFeed => {
                                                 // Don't add artificial spacing - only show protocol breaks
@@ -2380,6 +2444,7 @@ fn render_raster_image(
     printer_width_px: f32,
     bytes_per_line: usize,
     print_area_width: u16,
+    scale: [usize; 2],
 ) {
     // Use the actual bytes_per_line from the command, not recalculated
     let mut pixels = Vec::with_capacity(width * height);
@@ -2432,16 +2497,10 @@ fn render_raster_image(
         printer_width_px
     };
 
-    // Scale up the image for better visibility (thermal printers are 203 DPI, screens are ~96 DPI)
-    // Use adaptive scaling: small images (text) get 3x, large images (logos) get 1x
-    // Clamp so the image never exceeds the printable area
-    let scale_factor = if width > 300 || height > 150 {
-        1.0
-    } else {
-        3.0_f32.min(effective_width / width as f32)
-    };
-    let display_width = width as f32 * scale_factor;
-    let display_height = height as f32 * scale_factor;
+    // One printer dot is one UI point. Only the protocol can change image size;
+    // differently sized slices of the same receipt must use the same scale.
+    let display_width = (width * scale[0]) as f32;
+    let display_height = (height * scale[1]) as f32;
 
     // Allocate full printer width for proper alignment
     let (rect, _) = ui.allocate_exact_size(
@@ -2460,24 +2519,22 @@ fn render_raster_image(
     // For CENTER/RIGHT, center the printable area within the paper.
     // For LEFT, use left edge only.
     let x_offset = match alignment {
-        Alignment::Left => offset as f32 * scale_factor,
-        Alignment::Center => {
-            area_offset + (effective_width - display_width) / 2.0 + offset as f32 * scale_factor
-        }
-        Alignment::Right => {
-            area_offset + effective_width - display_width - offset as f32 * scale_factor
-        }
+        Alignment::Left => offset as f32,
+        Alignment::Center => area_offset + (effective_width - display_width) / 2.0 + offset as f32,
+        Alignment::Right => area_offset + effective_width - display_width - offset as f32,
     };
 
     let pos = egui::pos2(rect.left() + x_offset, rect.top());
     let size = egui::vec2(display_width, display_height);
 
-    ui.painter().image(
-        texture.id(),
-        egui::Rect::from_min_size(pos, size),
-        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-        egui::Color32::WHITE,
-    );
+    ui.painter()
+        .with_clip_rect(ui.clip_rect().intersect(rect))
+        .image(
+            texture.id(),
+            egui::Rect::from_min_size(pos, size),
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
 }
 
 fn render_qr_code(
